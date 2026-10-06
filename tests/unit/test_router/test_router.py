@@ -12,7 +12,7 @@ import warnings
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -69,6 +69,11 @@ from litellm.types.router import (
     PreRoutingHookResponse,
     RetryPolicy,
 )
+
+if TYPE_CHECKING:
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from litellm.integrations.otel.logger import OpenTelemetryV2
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -13213,15 +13218,22 @@ class TestTeamPublicNameReachesPreRoutingStrategies:
 
     @pytest.mark.asyncio
     async def test_team_public_name_shadows_a_global_model_for_that_team_only(self):
-        router = self._router(
-            {self.INTERNAL_NAME: self._RewriteStrategy()},
-            extra_deployments=({"model_name": self.PUBLIC_NAME, "litellm_params": {"model": "openai/gpt-4o"}},),
+        router: Final = litellm.Router(
+            model_list=[
+                self._team_marker(self.INTERNAL_NAME),
+                {"model_name": "gemini-flash", "litellm_params": {"model": "gemini/gemini-3.6-flash"}},
+                {"model_name": self.PUBLIC_NAME, "litellm_params": {"model": "openai/gpt-4o"}},
+            ],
         )
 
         async def routed(request_kwargs: dict) -> str | None:
             response = await router.async_pre_routing_hook(
                 model=self.PUBLIC_NAME, request_kwargs=request_kwargs, messages=self._messages()
             )
+            if response is not None:
+                assert response.routing_decision is not None
+                assert response.routing_decision["router_model_name"] == self.INTERNAL_NAME
+                assert response.routing_decision["router_config_id"] == router.model_list[0]["model_info"]["id"]
             return response.model if response else None
 
         async def selected(request_kwargs: dict) -> str:
@@ -20267,3 +20279,106 @@ async def test_non_chat_surfaces_mark_their_deployment_pick(monkeypatch: pytest.
     router.completion(model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
     assert events == [_pick("embed", "initial", 1), _pick("gpt-4o", "initial", 1)]
+
+
+class TestAutoRouterTraceProvenance:
+    @pytest.fixture
+    def _tracing(self, monkeypatch: pytest.MonkeyPatch) -> "tuple[OpenTelemetryV2, InMemorySpanExporter]":
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from litellm.integrations.otel import OpenTelemetryV2Config
+        from litellm.integrations.otel.logger import OpenTelemetryV2
+        from litellm.integrations.otel.plumbing import providers
+        from litellm.proxy import proxy_server
+
+        config: Final = OpenTelemetryV2Config(exporter="in_memory")
+        exporter: Final = InMemorySpanExporter()
+        logger: Final = OpenTelemetryV2(config=config, tracer_provider=providers.build_tracer_provider(config, exporter=exporter))
+        monkeypatch.setattr(proxy_server, "open_telemetry_logger", logger)
+        return logger, exporter
+
+    @staticmethod
+    def _marker(tag: str, target: str = "answer") -> dict[str, object]:
+        return {
+            "model_name": "traced-router",
+            "model_info": {"id": f"definition-{tag}", "updated_at": "2026-10-01T12:00:00+00:00"},
+            "litellm_params": {
+                "model": "auto_router/complexity_router", "tags": [tag],
+                "complexity_router_config": {
+                    "tiers": dict.fromkeys(("SIMPLE", "MEDIUM", "COMPLEX", "REASONING"), target),
+                },
+            },
+        }
+
+    def test_definition_fingerprint_is_canonical_and_tracks_config_not_credentials(self):
+        original: Final = Deployment.model_validate(self._marker("blue"))
+        reordered: Final = Deployment.model_validate({
+            **self._marker("blue"),
+            "litellm_params": {
+                "api_key": "credential-only-change", "tags": ["blue"], "model": "auto_router/complexity_router",
+                "complexity_router_config": {"tiers": dict.fromkeys(("REASONING", "COMPLEX", "MEDIUM", "SIMPLE"), "answer")},
+            },
+        })
+        fingerprint: Final = Router._routing_definition_fingerprint(original)
+        assert fingerprint is not None
+        assert fingerprint == Router._routing_definition_fingerprint(reordered)
+        assert fingerprint != Router._routing_definition_fingerprint(Deployment.model_validate(self._marker("blue", "other")))
+
+    @pytest.mark.asyncio
+    async def test_same_alias_and_tags_across_strategy_families_keep_selected_definition(
+        self, _tracing: "tuple[OpenTelemetryV2, InMemorySpanExporter]"
+    ) -> None:
+        logger, exporter = _tracing
+        router: Final = Router(model_list=[
+            self._marker("blue"),
+            {
+                "model_name": "traced-router",
+                "model_info": {"id": "definition-semantic"},
+                "litellm_params": {
+                    "model": "auto_router/semantic-router",
+                    "tags": ["blue"],
+                    "auto_router_config": json.dumps({"routes": [{"name": "answer", "utterances": ["hello"]}]}),
+                    "auto_router_default_model": "answer",
+                    "auto_router_embedding_model": "embed",
+                },
+            },
+        ])
+        with logger.start_phase_span("route traced-router"):
+            response: Final = await router.async_pre_routing_hook(
+                model="traced-router", request_kwargs={"metadata": {"tags": ["blue"]}}
+            )
+        assert response is None
+        span: Final = next(span for span in exporter.get_finished_spans() if span.name == "route traced-router")
+        assert span.attributes is not None
+        assert span.attributes["litellm.routing.router_config_id"] == router.model_list[1]["model_info"]["id"]
+        assert span.attributes["litellm.routing.router_type"] == "semantic"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("passthrough", [False, True])
+    async def test_attempt_spans_keep_selected_config_and_plain_fallback_clears_it(
+        self, _tracing: "tuple[OpenTelemetryV2, InMemorySpanExporter]", passthrough: bool
+    ) -> None:
+        logger, exporter = _tracing
+        router: Final = Router(model_list=[
+            self._marker("blue"), self._marker("green"),
+            {"model_name": "answer", "litellm_params": {"model": "openai/gpt-5.6-luna", "api_key": "test", "use_in_pass_through": True, "tags": ["blue", "green"]}},
+        ], enable_tag_filtering=True)
+        request: Final = {"metadata": {"tags": ["green"]}, "litellm_metadata": {"tags": ["green"]}}
+        pick: Final = router.async_get_available_deployment_for_pass_through if passthrough else router.async_get_available_deployment
+        with logger.tracer.start_as_current_span("request"):
+            await pick(model="traced-router", request_kwargs=request, messages=[{"role": "user", "content": "hello"}])
+            decision: Final = request["litellm_metadata"]["routing_decision"]
+            assert decision["router_config_id"] == "definition-green"
+            assert decision["router_config_updated_at"] == "2026-10-01T12:00:00+00:00"
+            assert decision["router_config_fingerprint"] == router.complexity_routers["traced-router"][1].definition_fingerprint
+            assert "routing_decision" not in request["metadata"]
+            router.log_retry({**request, "model": "answer"}, ValueError("private-error-text"))
+            await pick(model="answer", request_kwargs=request, messages=[{"role": "user", "content": "hello"}])
+        assert "routing_decision" not in request["litellm_metadata"]
+        spans: Final = {span.name: span for span in exporter.get_finished_spans()}
+        assert spans["route traced-router"].attributes["litellm.routing.router_config_id"] == "definition-green"
+        assert spans["route traced-router"].attributes["litellm.routing.routed_model"] == "answer"
+        assert not any(key.startswith("litellm.routing.") for key in spans["route answer"].attributes)
+        retry: Final = next(event for event in spans["request"].events if event.name == "litellm.routing.retry")
+        assert retry.attributes["error.type"] == "ValueError"
+        assert retry.attributes["litellm.retry.count"] == 1
+        assert "private-error-text" not in str(retry.attributes)
